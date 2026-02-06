@@ -7,8 +7,10 @@ const cron = require('node-cron');
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-const API_URL_HU = 'https://wtx.tele68.com/v1/tx/sessions';
-const API_URL_MD5 = 'https://wtxmd52.tele68.com/v1/txmd5/sessions';
+// API URL cũ theo yêu cầu
+const API_URL_TX = 'https://jakpotgwab.geightdors.net/glms/v1/notify/taixiu?platform_id=g8&gid=vgmn_101';
+const API_URL_MD5 = 'https://jakpotgwab.geightdors.net/glms/v1/notify/taixiu?platform_id=g8&gid=vgmn_100';
+
 const LEARNING_FILE = 'learning_data.json';
 const HISTORY_FILE = 'prediction_history.json';
 
@@ -123,41 +125,88 @@ function normalizeResult(result) {
   return result.toLowerCase();
 }
 
-function transformApiData(apiData) {
-  if (!apiData || !apiData.list || !Array.isArray(apiData.list)) {
-    return null;
+// Hàm xử lý API cũ (giống code Python)
+function processOldApiData(apiData, isMD5 = false) {
+  if (!apiData || !apiData.data || !Array.isArray(apiData.data)) {
+    return [];
   }
   
-  return apiData.list.map(item => {
-    const result = item.resultTruyenThong === 'TAI' ? 'Tài' : 'Xỉu';
-    return {
-      Phien: item.id,
-      Ket_qua: result,
-      Xuc_xac_1: item.dices[0],
-      Xuc_xac_2: item.dices[1],
-      Xuc_xac_3: item.dices[2],
-      Tong: item.point
-    };
+  const results = [];
+  
+  apiData.data.forEach(game => {
+    const cmd = game.cmd;
+    
+    if (isMD5 && cmd === 2006) {
+      // Xử lý MD5
+      const { sid, d1, d2, d3 } = game;
+      if (sid && d1 !== undefined && d2 !== undefined && d3 !== undefined) {
+        const total = d1 + d2 + d3;
+        const ket_qua = total <= 10 ? 'Xỉu' : 'Tài';
+        
+        results.push({
+          Phien: sid,
+          Ket_qua: ket_qua,
+          Xuc_xac_1: d1,
+          Xuc_xac_2: d2,
+          Xuc_xac_3: d3,
+          Tong: total
+        });
+      }
+    } else if (!isMD5 && cmd === 1003) {
+      // Xử lý TX thường
+      const { d1, d2, d3 } = game;
+      // Tìm sid từ cmd 1008 trong cùng response
+      const sidGame = apiData.data.find(g => g.cmd === 1008);
+      const sid = sidGame ? sidGame.sid : null;
+      
+      if (sid && d1 !== undefined && d2 !== undefined && d3 !== undefined) {
+        const total = d1 + d2 + d3;
+        const ket_qua = total <= 10 ? 'Xỉu' : 'Tài';
+        
+        results.push({
+          Phien: sid,
+          Ket_qua: ket_qua,
+          Xuc_xac_1: d1,
+          Xuc_xac_2: d2,
+          Xuc_xac_3: d3,
+          Tong: total
+        });
+      }
+    }
   });
+  
+  // Sắp xếp theo phiên giảm dần (mới nhất đầu tiên)
+  results.sort((a, b) => b.Phien - a.Phien);
+  
+  // Giới hạn số lượng
+  return results.slice(0, 50);
 }
 
 async function fetchDataHu() {
   try {
-    const response = await axios.get(API_URL_HU);
-    return transformApiData(response.data);
+    const response = await axios.get(API_URL_TX, {
+      headers: { 'User-Agent': 'Mozilla/5.0' },
+      timeout: 10000
+    });
+    
+    return processOldApiData(response.data, false);
   } catch (error) {
-    console.error('Error fetching HU data:', error.message);
-    return null;
+    console.error('Error fetching HU data from old API:', error.message);
+    return [];
   }
 }
 
 async function fetchDataMd5() {
   try {
-    const response = await axios.get(API_URL_MD5);
-    return transformApiData(response.data);
+    const response = await axios.get(API_URL_MD5, {
+      headers: { 'User-Agent': 'Mozilla/5.0' },
+      timeout: 10000
+    });
+    
+    return processOldApiData(response.data, true);
   } catch (error) {
-    console.error('Error fetching MD5 data:', error.message);
-    return null;
+    console.error('Error fetching MD5 data from old API:', error.message);
+    return [];
   }
 }
 
@@ -261,6 +310,23 @@ function analyzeDistribution(data, windowSize = 50) {
 
 // ==================== PREDICTION ENGINE ====================
 function calculatePrediction(data, type) {
+  if (data.length === 0) {
+    return {
+      prediction: 'tai',
+      confidence: 50,
+      factors: ['Không có dữ liệu'],
+      detailedAnalysis: {
+        totalPatterns: 0,
+        taiVotes: 0,
+        xiuVotes: 0,
+        taiScore: 0,
+        xiuScore: 0,
+        topPattern: 'N/A',
+        distribution: { taiPercent: 50, xiuPercent: 50, imbalance: 0 }
+      }
+    };
+  }
+  
   const last50 = data.slice(0, 50);
   const results = last50.map(d => d.Ket_qua);
   
@@ -293,7 +359,7 @@ function calculatePrediction(data, type) {
   }
   
   if (predictions.length === 0) {
-    predictions.push({ prediction: results[0], confidence: 5, priority: 1, name: 'Cầu Tự Nhiên' });
+    predictions.push({ prediction: results[0] || 'Tài', confidence: 5, priority: 1, name: 'Cầu Tự Nhiên' });
     factors.push('Cầu Tự Nhiên (Theo Ván Trước)');
   }
   
@@ -493,29 +559,35 @@ async function autoProcessPredictions() {
   }
 }
 
-// ==================== EXPRESS ENDPOINTS ====================
+// ==================== EXPRESS ENDPOINTS (ĐÃ ĐỔI TÊN) ====================
 app.get('/', (req, res) => {
   res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-  res.send('t.me/CuTools');
+  res.send('Prediction API - ID: @Kapubb\nEndpoints: /hit-hu /hit-md5 /hit-hu/lichsu /hit-md5/lichsu');
 });
 
-app.get('/lc79-hu', async (req, res) => {
+// ENDPOINT MỚI: /hit-hu (thay cho /lc79-hu)
+app.get('/hit-hu', async (req, res) => {
   try {
     const data = await fetchDataHu();
-    if (!data || data.length === 0) {
-      return res.status(500).json({ error: 'Không thể lấy dữ liệu' });
+    
+    // Tìm phiên tiếp theo
+    let nextPhien = 1;
+    if (data && data.length > 0) {
+      const latestPhien = data[0].Phien;
+      nextPhien = latestPhien + 1;
     }
-    
-    await verifyPredictions('hu', data);
-    
-    const latestPhien = data[0].Phien;
-    const nextPhien = latestPhien + 1;
     
     const result = calculatePrediction(data, 'hu');
     
+    // Lưu vào lịch sử
     savePredictionToHistory('hu', nextPhien, result.prediction, result.confidence);
     recordPrediction('hu', nextPhien, result.prediction, result.confidence, result.factors);
     
+    // Xác minh dự đoán cũ
+    if (data && data.length > 0) {
+      await verifyPredictions('hu', data);
+    }
+    
     res.json({
       phien: nextPhien.toString(),
       du_doan: normalizeResult(result.prediction),
@@ -523,27 +595,39 @@ app.get('/lc79-hu', async (req, res) => {
       id: '@Kapubb'
     });
   } catch (error) {
-    console.error('Error:', error);
-    res.status(500).json({ error: 'Lỗi server' });
+    console.error('Error in /hit-hu:', error);
+    res.status(500).json({ 
+      error: 'Lỗi server',
+      phien: '1',
+      du_doan: 'tai',
+      ti_le: '50%',
+      id: '@Kapubb'
+    });
   }
 });
 
-app.get('/lc79-md5', async (req, res) => {
+// ENDPOINT MỚI: /hit-md5 (thay cho /lc79-md5)
+app.get('/hit-md5', async (req, res) => {
   try {
     const data = await fetchDataMd5();
-    if (!data || data.length === 0) {
-      return res.status(500).json({ error: 'Không thể lấy dữ liệu' });
+    
+    // Tìm phiên tiếp theo
+    let nextPhien = 1;
+    if (data && data.length > 0) {
+      const latestPhien = data[0].Phien;
+      nextPhien = latestPhien + 1;
     }
-    
-    await verifyPredictions('md5', data);
-    
-    const latestPhien = data[0].Phien;
-    const nextPhien = latestPhien + 1;
     
     const result = calculatePrediction(data, 'md5');
     
+    // Lưu vào lịch sử
     savePredictionToHistory('md5', nextPhien, result.prediction, result.confidence);
     recordPrediction('md5', nextPhien, result.prediction, result.confidence, result.factors);
+    
+    // Xác minh dự đoán cũ
+    if (data && data.length > 0) {
+      await verifyPredictions('md5', data);
+    }
     
     res.json({
       phien: nextPhien.toString(),
@@ -552,12 +636,19 @@ app.get('/lc79-md5', async (req, res) => {
       id: '@Kapubb'
     });
   } catch (error) {
-    console.error('Error:', error);
-    res.status(500).json({ error: 'Lỗi server' });
+    console.error('Error in /hit-md5:', error);
+    res.status(500).json({ 
+      error: 'Lỗi server',
+      phien: '1',
+      du_doan: 'tai',
+      ti_le: '50%',
+      id: '@Kapubb'
+    });
   }
 });
 
-app.get('/lc79-hu/lichsu', async (req, res) => {
+// ENDPOINT MỚI: /hit-hu/lichsu
+app.get('/hit-hu/lichsu', async (req, res) => {
   try {
     const data = await fetchDataHu();
     if (data && data.length > 0) {
@@ -565,7 +656,7 @@ app.get('/lc79-hu/lichsu', async (req, res) => {
     }
     
     res.json({
-      type: 'Lẩu Cua 79 - Tài Xỉu Hũ',
+      type: 'HIT - Tài Xỉu Hũ',
       history: predictionHistory.hu.map(record => ({
         phien: record.phien,
         du_doan: record.du_doan,
@@ -586,14 +677,15 @@ app.get('/lc79-hu/lichsu', async (req, res) => {
     });
   } catch (error) {
     res.json({
-      type: 'Lẩu Cua 79 - Tài Xỉu Hũ',
+      type: 'HIT - Tài Xỉu Hũ',
       history: predictionHistory.hu,
       total: predictionHistory.hu.length
     });
   }
 });
 
-app.get('/lc79-md5/lichsu', async (req, res) => {
+// ENDPOINT MỚI: /hit-md5/lichsu
+app.get('/hit-md5/lichsu', async (req, res) => {
   try {
     const data = await fetchDataMd5();
     if (data && data.length > 0) {
@@ -601,7 +693,7 @@ app.get('/lc79-md5/lichsu', async (req, res) => {
     }
     
     res.json({
-      type: 'Lẩu Cua 79 - Tài Xỉu MD5',
+      type: 'HIT - Tài Xỉu MD5',
       history: predictionHistory.md5.map(record => ({
         phien: record.phien,
         du_doan: record.du_doan,
@@ -622,21 +714,17 @@ app.get('/lc79-md5/lichsu', async (req, res) => {
     });
   } catch (error) {
     res.json({
-      type: 'Lẩu Cua 79 - Tài Xỉu MD5',
+      type: 'HIT - Tài Xỉu MD5',
       history: predictionHistory.md5,
       total: predictionHistory.md5.length
     });
   }
 });
 
-app.get('/lc79-hu/analysis', async (req, res) => {
+// ENDPOINT MỚI: /hit-hu/analysis
+app.get('/hit-hu/analysis', async (req, res) => {
   try {
     const data = await fetchDataHu();
-    if (!data || data.length === 0) {
-      return res.status(500).json({ error: 'Không thể lấy dữ liệu' });
-    }
-    
-    await verifyPredictions('hu', data);
     
     const result = calculatePrediction(data, 'hu');
     res.json({
@@ -658,14 +746,10 @@ app.get('/lc79-hu/analysis', async (req, res) => {
   }
 });
 
-app.get('/lc79-md5/analysis', async (req, res) => {
+// ENDPOINT MỚI: /hit-md5/analysis
+app.get('/hit-md5/analysis', async (req, res) => {
   try {
     const data = await fetchDataMd5();
-    if (!data || data.length === 0) {
-      return res.status(500).json({ error: 'Không thể lấy dữ liệu' });
-    }
-    
-    await verifyPredictions('md5', data);
     
     const result = calculatePrediction(data, 'md5');
     res.json({
@@ -687,7 +771,8 @@ app.get('/lc79-md5/analysis', async (req, res) => {
   }
 });
 
-app.get('/lc79-hu/stats', (req, res) => {
+// ENDPOINT MỚI: /hit-hu/stats
+app.get('/hit-hu/stats', (req, res) => {
   const stats = learningData.hu;
   const accuracy = stats.totalPredictions > 0 
     ? (stats.correctPredictions / stats.totalPredictions * 100).toFixed(2)
@@ -698,7 +783,7 @@ app.get('/lc79-hu/stats', (req, res) => {
     : 0;
   
   res.json({
-    type: 'Lẩu Cua 79 - Tài Xỉu Hũ',
+    type: 'HIT - Tài Xỉu Hũ',
     totalPredictions: stats.totalPredictions,
     correctPredictions: stats.correctPredictions,
     overallAccuracy: `${accuracy}%`,
@@ -713,7 +798,8 @@ app.get('/lc79-hu/stats', (req, res) => {
   });
 });
 
-app.get('/lc79-md5/stats', (req, res) => {
+// ENDPOINT MỚI: /hit-md5/stats
+app.get('/hit-md5/stats', (req, res) => {
   const stats = learningData.md5;
   const accuracy = stats.totalPredictions > 0 
     ? (stats.correctPredictions / stats.totalPredictions * 100).toFixed(2)
@@ -724,7 +810,7 @@ app.get('/lc79-md5/stats', (req, res) => {
     : 0;
   
   res.json({
-    type: 'Lẩu Cua 79 - Tài Xỉu MD5',
+    type: 'HIT - Tài Xỉu MD5',
     totalPredictions: stats.totalPredictions,
     correctPredictions: stats.correctPredictions,
     overallAccuracy: `${accuracy}%`,
@@ -750,21 +836,21 @@ cron.schedule('*/30 * * * * *', () => {
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server running on http://0.0.0.0:${PORT}`);
-  console.log('Lẩu Cua 79 - Tài Xỉu Prediction API');
+  console.log('HIT - Tài Xỉu Prediction API');
   console.log('ID: @Kapubb');
   console.log('');
-  console.log('API SOURCES:');
-  console.log('  - TX Hũ: ' + API_URL_HU);
+  console.log('API SOURCES (OLD API):');
+  console.log('  - TX Hũ: ' + API_URL_TX);
   console.log('  - TX MD5: ' + API_URL_MD5);
   console.log('');
-  console.log('Endpoints:');
+  console.log('NEW ENDPOINTS:');
   console.log('  / - Homepage');
-  console.log('  /lc79-hu - Dự đoán Tài Xỉu Hũ');
-  console.log('  /lc79-md5 - Dự đoán Tài Xỉu MD5');
-  console.log('  /lc79-hu/lichsu - Lịch sử dự đoán Hũ (có trạng thái đúng/sai)');
-  console.log('  /lc79-md5/lichsu - Lịch sử dự đoán MD5 (có trạng thái đúng/sai)');
-  console.log('  /lc79-hu/analysis - Phân tích chi tiết Hũ');
-  console.log('  /lc79-md5/analysis - Phân tích chi tiết MD5');
-  console.log('  /lc79-hu/stats - Thống kê dự đoán Hũ');
-  console.log('  /lc79-md5/stats - Thống kê dự đoán MD5');
+  console.log('  /hit-hu - Dự đoán Tài Xỉu Hũ');
+  console.log('  /hit-md5 - Dự đoán Tài Xỉu MD5');
+  console.log('  /hit-hu/lichsu - Lịch sử dự đoán Hũ (có trạng thái đúng/sai)');
+  console.log('  /hit-md5/lichsu - Lịch sử dự đoán MD5 (có trạng thái đúng/sai)');
+  console.log('  /hit-hu/analysis - Phân tích chi tiết Hũ');
+  console.log('  /hit-md5/analysis - Phân tích chi tiết MD5');
+  console.log('  /hit-hu/stats - Thống kê dự đoán Hũ');
+  console.log('  /hit-md5/stats - Thống kê dự đoán MD5');
 });
